@@ -220,7 +220,7 @@ double gauss_newton(const double rgb[3], double coeffs[3], int it = 15) {
             coeffs[j] -= x[j];
             r += residual[j] * residual[j];
         }
-        double max = std::max({coeffs[0], coeffs[1], coeffs[2]});
+        double max = std::max(std::max(coeffs[0], coeffs[1]), coeffs[2]);
 
         if (max > 200) {
             for (int j = 0; j < 3; ++j)
