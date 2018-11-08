@@ -1,0 +1,8 @@
+Makefile
+CMakeCache.txt
+CMakeFiles
+*.cmake
+rgb2spec_opt
+librgb2spec.a
+.ninja_*
+*.ninja
