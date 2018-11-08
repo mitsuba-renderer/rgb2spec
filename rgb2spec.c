@@ -91,8 +91,8 @@ void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]
           y     = rgb[(i + 2) % 3] * scale;
 
     /* Trilinearly interpolated lookup */
-    uint32_t xi = rgb2spec_min((uint32_t) x, res - 2),
-             yi = rgb2spec_min((uint32_t) y, res - 2),
+    uint32_t xi = rgb2spec_min((uint32_t) x, (uint32_t) (res - 2)),
+             yi = rgb2spec_min((uint32_t) y, (uint32_t) (res - 2)),
              zi = rgb2spec_find_interval(model->scale, model->res, z),
              offset = (((i * res + zi) * res + yi) * res + xi) * RGB2SPEC_N_COEFFS,
              dx = RGB2SPEC_N_COEFFS,
@@ -158,7 +158,7 @@ __m128 rgb2spec_eval_sse(float coeff[RGB2SPEC_N_COEFFS], __m128 lambda) {
     __m128 x = rgb2spec_fma128(rgb2spec_fma128(c0, lambda, c1), lambda, c2),
            y = _mm_rsqrt_ps(rgb2spec_fma128(x, x, o));
 
-    return rgb2spec_fma128(h * x, y, h);
+    return rgb2spec_fma128(_mm_mul_ps(h, x), y, h);
 }
 #endif
 
@@ -180,7 +180,7 @@ __m256 rgb2spec_eval_avx(float coeff[RGB2SPEC_N_COEFFS], __m256 lambda) {
     __m256 x = rgb2spec_fma256(rgb2spec_fma256(c0, lambda, c1), lambda, c2),
            y = _mm256_rsqrt_ps(rgb2spec_fma256(x, x, o));
 
-    return rgb2spec_fma256(h * x, y, h);
+    return rgb2spec_fma256(_mm256_mul_ps(h, x), y, h);
 }
 #endif
 
@@ -193,7 +193,7 @@ __m512 rgb2spec_eval_avx512(float coeff[RGB2SPEC_N_COEFFS], __m512 lambda) {
     __m512 x = _mm512_fmadd_ps(_mm512_fmadd_ps(c0, lambda, c1), lambda, c2),
            y = _mm512_rsqrt14_ps(_mm512_fmadd_ps(x, x, o));
 
-    return _mm512_fmadd_ps(h * x, y, h);
+    return _mm512_fmadd_ps(_mm512_mul_ps(h, x), y, h);
 }
 #endif
 

@@ -1,7 +1,12 @@
+#if defined(_MSC_VER)
+#  define NOMINMAX
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
+#include <algorithm>
 
 #include "details/cie1931.h"
 #include "details/lu.h"

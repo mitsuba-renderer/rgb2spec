@@ -1,7 +1,7 @@
 cmake_minimum_required (VERSION 3.2.0)
 project(rgb2spec)
 
-if (POLICY CMP0062)
+if (POLICY CMP0068)
   cmake_policy(SET CMP0068 NEW)
 endif()
 
@@ -17,24 +17,34 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|Intel")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 endif()
 
-if (TBB_INCLUDE_DIRS)
+if (TARGET tbb)
   add_definitions(-DRGB2SPEC_USE_TBB=1)
+  include_directories(${TBB_INCLUDE_DIRS})
 endif()
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_executable(rgb2spec_opt rgb2spec_opt.cpp)
 add_library(rgb2spec STATIC rgb2spec.c)
 
-if (TBB_INCLUDE_DIRS)
+if (TARGET tbb)
   target_link_libraries(rgb2spec_opt PRIVATE tbb)
+
+  add_custom_command(TARGET rgb2spec_opt POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_FILE:tbb>
+      $<TARGET_FILE_DIR:rgb2spec_opt>
+  )
 endif()
 
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/srgb.coeff
   DEPENDS rgb2spec_opt
-  COMMAND $<TARGET_FILE:rgb2spec_opt> 32 ${CMAKE_CURRENT_BINARY_DIR}/srgb.coeff
+  COMMAND ${CMAKE_COMMAND} -E env LD_LIBRARY_PATH=.:$ENV{LD_LIBRARY_PATH}
+  $<TARGET_FILE:rgb2spec_opt> 64 ${CMAKE_CURRENT_BINARY_DIR}/srgb.coeff
 )
 
 add_custom_target(
-  optimize
+  rgb2spec_opt_run
   DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/srgb.coeff
 )
