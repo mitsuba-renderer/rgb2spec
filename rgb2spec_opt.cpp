@@ -34,6 +34,7 @@ enum Gamut {
     REC2020,
     ERGB,
     XYZ,
+    NO_GAMUT,
 };
 
 double sigmoid(double x) {
@@ -238,12 +239,35 @@ double gauss_newton(const double rgb[3], double coeffs[3], int it = 15) {
     return std::sqrt(r);
 }
 
+static Gamut parse_gamut(const char *str) {
+    if (!strcasecmp(str, "sRGB"))
+        return SRGB;
+    if (!strcasecmp(str, "eRGB"))
+        return ERGB;
+    if (!strcasecmp(str, "XYZ"))
+        return XYZ;
+    if (!strcasecmp(str, "ProPhotoRGB"))
+        return ProPhotoRGB;
+    if (!strcasecmp(str, "ACES2065_1"))
+        return ACES2065_1;
+    if (!strcasecmp(str, "REC2020"))
+        return REC2020;
+    return NO_GAMUT;
+}
+
 int main(int argc, char **argv) {
-    init_tables(SRGB);
-    if (argc != 3) {
-        printf("Syntax: rgb2spec_opt <resolution> <output>\n");
+    if (argc < 3) {
+        printf("Syntax: rgb2spec_opt <resolution> <output> [<gamut>]\n"
+               "where <gamut> is one of sRGB,eRGB,XYZ,ProPhotoRGB,ACES2065_1,REC2020\n");
         exit(-1);
     }
+    Gamut gamut = SRGB;
+    if (argc > 3) gamut = parse_gamut(argv[3]);
+    if (gamut == NO_GAMUT) {
+        fprintf(stderr, "Could not parse gamut `%s'!\n", argv[3]);
+        exit(-1);
+    }
+    init_tables(gamut);
 
     const int res = atoi(argv[1]);
     if (res == 0) {
