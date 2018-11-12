@@ -11,8 +11,14 @@
 #include "details/cie1931.h"
 #include "details/lu.h"
 
+// Choose a parallelization scheme
 #if defined(RGB2SPEC_USE_TBB)
 #  include <tbb/tbb.h>
+#elif defined(_OPENMP)
+#  define RGB2SPEC_USE_OPENMP 1
+#elif defined(__APPLE__)
+#  define RGB2SPEC_USE_GCD    1
+#  include <dispatch/dispatch.h>
 #endif
 
 /// Discretization of quadrature scheme
@@ -127,6 +133,9 @@ void init_tables(Gamut gamut) {
             memcpy(xyz_to_rgb, xyz_to_rec2020, sizeof(double) * 9);
             memcpy(rgb_to_xyz, rec2020_to_xyz, sizeof(double) * 9);
             break;
+
+        default:
+            throw std::runtime_error("init_gamut(): invalid/unsupported gamut.");
     }
 
     for (int i = 0; i < CIE_FINE_SAMPLES; ++i) {
@@ -275,7 +284,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
 
-    printf("Optimizing ");
+    printf("Optimizing spectra ");
 
     float *scale = new float[res];
     for (int k = 0; k < res; ++k)
@@ -284,13 +293,14 @@ int main(int argc, char **argv) {
     size_t bufsize = 3*3*res*res*res;
     float *out = new float[bufsize];
 
-#if defined(_OPENMP)
-#pragma omp parallel for collapse(2) default(none) schedule(dynamic) shared(stdout,scale,out)
+#if defined(RGB2SPEC_USE_OPENMP)
+#  pragma omp parallel for collapse(2) default(none) schedule(dynamic) shared(stdout,scale,out)
 #endif
     for (int l = 0; l < 3; ++l) {
-#if !defined(_OPENMP) && defined(RGB2SPEC_USE_TBB)
+#if defined(RGB2SPEC_USE_TBB)
         tbb::parallel_for(0, res, [&](size_t j) {
-
+#elif defined(RGB2SPEC_USE_GCD)
+        dispatch_apply(res, dispatch_get_global_queue(0, 0), ^(size_t j) {
 #else
         for (int j = 0; j < res; ++j) {
 #endif
@@ -348,7 +358,7 @@ int main(int argc, char **argv) {
                 }
             }
         }
-#if defined(RGB2SPEC_USE_TBB)
+#if defined(RGB2SPEC_USE_TBB) || defined(RGB2SPEC_USE_GCD)
         );
 #endif
     }
@@ -365,5 +375,5 @@ int main(int argc, char **argv) {
     delete[] out;
     delete[] scale;
     fclose(f);
-    printf("\n");
+    printf(" done.\n");
 }
