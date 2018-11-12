@@ -260,8 +260,11 @@ int main(int argc, char **argv) {
     size_t bufsize = 3*3*res*res*res;
     float *out = new float[bufsize];
 
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) default(none) schedule(dynamic) shared(stdout,scale,out)
+#endif
     for (int l = 0; l < 3; ++l) {
-#if defined(RGB2SPEC_USE_TBB)
+#if !defined(_OPENMP) && defined(RGB2SPEC_USE_TBB)
         tbb::parallel_for(0, res, [&](size_t j) {
 
 #else
