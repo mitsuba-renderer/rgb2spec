@@ -139,7 +139,6 @@ float rgb2spec_eval_fast(float coeff[RGB2SPEC_N_COEFFS], float lambda) {
     return rgb2spec_fma(.5f * x, y, .5f);
 }
 
-
 #if defined(__SSE4_2__)
 static inline __m128 rgb2spec_fma128(__m128 a, __m128 b, __m128 c) {
     #if defined(__FMA__)
