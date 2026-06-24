@@ -52,7 +52,7 @@ RGB2Spec *rgb2spec_load(const char *filename) {
         return NULL;
     }
 
-    /* Forward-model block consumed by rgb2spec_fetch_opt(). */
+    // Forward-model block consumed by rgb2spec_fetch_opt().
     if (fread(&m->nfine, sizeof(uint32_t), 1, f) != 1 || m->nfine == 0) {
         fclose(f);
         rgb2spec_free(m);
@@ -121,7 +121,7 @@ static int rgb2spec_fetch_mono(const float rgb[3], float out[RGB2SPEC_N_COEFFS])
 
 /// Convert an RGB value into a RGB2Spec coefficient representation
 void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]) {
-    /* Determine largest RGB component */
+    // Determine largest RGB component
     int i = 0, res = model->res;
     float rgb[3];
     for (int j = 0; j < 3; ++j)
@@ -150,7 +150,7 @@ void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]
     x     = rgb[(i + 1) % 3] * scale;
     y     = rgb[(i + 2) % 3] * scale;
 
-    /* Trilinearly interpolated lookup */
+    // Trilinearly interpolated lookup
     uint32_t xi = rgb2spec_min((uint32_t) x, (uint32_t) (res - 2)),
              yi = rgb2spec_min((uint32_t) y, (uint32_t) (res - 2)),
              zi = rgb2spec_find_interval(model->scale, model->res, z),
@@ -179,8 +179,7 @@ void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]
 }
 
 /* ---- One Levenberg-Marquardt refinement step (fetch_opt) ----
- *
- * The work happens in the scaled-wavelength domain (lambda in [0,1]) so that
+ * The problem is parameterized using scaled wavelengths (lambda in [0,1]) so that
  * the math below stays well conditioned in single precision. */
 
 /* Relative tristimulus t = (rgb_to_xyz * rgb) / whitepoint, shared by the two
@@ -303,7 +302,7 @@ void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEF
 
     const float c0 = 360.f, c1 = 1.f / (830.f - 360.f);
 
-    /* Interpolated coeffs are wavelength-domain; move to the scaled domain. */
+    // Interpolated coeffs are wavelength-domain; move to the scaled domain.
     float A = out[0], B = out[1], C = out[2];
     float c[3] = { A / (c1*c1),
                    2.f*A*c0/c1 + B/c1,
@@ -311,11 +310,11 @@ void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEF
 
     int n = (int) model->nfine;
     const float *lam = model->fwd;
-    const float *W   = model->fwd + n;          /* W[j*n + i] = rgb_tbl[j][i] */
+    const float *W   = model->fwd + n;          // W[j*n + i] = rgb_tbl[j][i]
     const float *r2x = model->fwd + 4*n;
     const float *wp  = model->fwd + 4*n + 9;
 
-    /* Single pass: reproduced color and its Jacobian w.r.t. the coefficients. */
+    // Single pass: reproduced color and its Jacobian w.r.t. the coefficients.
     float orgb[3] = { 0, 0, 0 };
     float dout[3][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
     for (int i = 0; i < n; ++i) {
@@ -334,11 +333,11 @@ void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEF
 
     float tgt_lab[3], res[3], olab[3], lab_jac[3][3], J[3][3];
     rgb2spec_lab(r2x, wp, tgt, tgt_lab);
-    rgb2spec_lab_jac(r2x, wp, orgb, olab, lab_jac);   /* Lab + Jacobian, one pass */
+    rgb2spec_lab_jac(r2x, wp, orgb, olab, lab_jac);   // Lab + Jacobian, one pass
     for (int j = 0; j < 3; ++j) res[j] = tgt_lab[j] - olab[j];
     float r0 = res[0]*res[0] + res[1]*res[1] + res[2]*res[2];
 
-    /* J = d(residual)/d(coeffs); then the normal-equation terms J^T J and J^T res. */
+    // J = d(residual)/d(coeffs); then the normal-equation terms J^T J and J^T res.
     for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) {
             float s = 0;
@@ -358,11 +357,11 @@ void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEF
             g[a] += J[k][a] * res[k];
     }
 
-    /* One Levenberg-Marquardt step: solve (J^T J + lambda*I) step = g, coeffs -=
-       step. lambda = 0 is the undamped Gauss-Newton step, near-exact in the gamut
-       interior. Near the boundary the spectrum saturates and that step overshoots,
-       so raise 'lambda' (shortening the step toward gradient descent) until one
-       reduces the residual below the un-refined r0. */
+    // One Levenberg-Marquardt step: solve (J^T J + lambda*I) step = g, coeffs -=
+    // step. lambda = 0 is the undamped Gauss-Newton step, near-exact in the gamut
+    // interior. Near the boundary the spectrum saturates and that step overshoots,
+    // so raise 'lambda' (shortening the step toward gradient descent) until one
+    // reduces the residual below the un-refined r0.
     float lambda = 0.f;
     for (int t = 0; t < 20; ++t) {
         float M[3][3];
@@ -380,7 +379,7 @@ void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEF
         lambda = lambda ? lambda * 10.f : 1e-3f;
     }
 
-    /* Back to the wavelength domain (the format rgb2spec_eval expects). */
+    // Back to the wavelength domain (the format rgb2spec_eval expects).
     out[0] = c[0] * (c1*c1);
     out[1] = c[1]*c1 - 2.f*c[0]*c0*(c1*c1);
     out[2] = c[2] - c[1]*c0*c1 + c[0]*(c0*c1)*(c0*c1);
