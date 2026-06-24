@@ -5,8 +5,10 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <stdexcept>
-#include <iostream>
 #include <algorithm>
 
 #include "details/cie1931.h"
@@ -210,43 +212,85 @@ void eval_jacobian(const double *coeffs, const double *rgb, double **jac) {
     }
 }
 
-double gauss_newton(const double rgb[3], double coeffs[3], int it = 15) {
-    double r = 0;
-    for (int i = 0; i < it; ++i) {
+/**
+ * Find the polynomial coefficients whose sigmoidal spectrum best reproduces the
+ * target color 'rgb'. The objective is the squared CIELab distance, minimized
+ * with the Levenberg-Marquardt algorithm.
+ *
+ * Inside the gamut the target color is exactly reachable, the Jacobian is well
+ * conditioned, and LM converges quadratically to a zero residual. Near or beyond
+ * the gamut boundary no exact solution exists and the Jacobian becomes singular
+ * as the spectrum saturates; there the adaptive 'lambda' damping regularizes the
+ * step so the method settles at the closest achievable color instead of diverging.
+ */
+double LM(const double rgb[3], double coeffs[3], int it = 15) {
+    double residual[3];
+    eval_residual(coeffs, rgb, residual);
+    double cost = sqr(residual[0]) + sqr(residual[1]) + sqr(residual[2]);
+
+    double lambda = 1e-3;
+
+    for (int i = 0; i < it && cost > 1e-12; ++i) {
         double J0[3], J1[3], J2[3], *J[3] = { J0, J1, J2 };
+        eval_jacobian(coeffs, rgb, J); /* J[k][a] = d residual[k] / d coeffs[a] */
 
-        double residual[3];
-
-        eval_residual(coeffs, rgb, residual);
-        eval_jacobian(coeffs, rgb, J);
-
-        int P[4];
-        int rv = LUPDecompose(J, 3, 1e-15, P);
-        if (rv != 1) {
-            std::cout << "RGB " << rgb[0] << " " << rgb[1] << " " << rgb[2] << std::endl;
-            std::cout << "-> " << coeffs[0] << " " << coeffs[1] << " " << coeffs[2] << std::endl;
-            throw std::runtime_error("LU decomposition failed!");
+        /* Assemble the normal equations: A = J^T J,  g = J^T residual */
+        double A[3][3], g[3] = { 0.0, 0.0, 0.0 };
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) {
+                double s = 0.0;
+                for (int k = 0; k < 3; ++k)
+                    s += J[k][a] * J[k][b];
+                A[a][b] = s;
+            }
+            for (int k = 0; k < 3; ++k)
+                g[a] += J[k][a] * residual[k];
         }
 
-        double x[3];
-        LUPSolve(J, P, residual, 3, x);
+        /* Try damped steps, increasing 'lambda', until one decreases the cost */
+        bool accepted = false;
+        for (int t = 0; t < 10 && !accepted; ++t) {
+            double M0[3], M1[3], M2[3], *M[3] = { M0, M1, M2 };
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b)
+                    M[a][b] = A[a][b] + (a == b ? lambda : 0.0); /* A + lambda*I */
 
-        r = 0.0;
-        for (int j = 0; j < 3; ++j) {
-            coeffs[j] -= x[j];
-            r += residual[j] * residual[j];
+            int P[4];
+            if (LUPDecompose(M, 3, 1e-30, P) != 1) {
+                lambda *= 10.0; /* singular even when damped -> damp harder */
+                continue;
+            }
+
+            /* Solve (A + lambda*I) step = g;  the LM update is coeffs -= step */
+            double step[3];
+            LUPSolve(M, P, g, 3, step);
+
+            double trial[3] = { coeffs[0] - step[0],
+                                coeffs[1] - step[1],
+                                coeffs[2] - step[2] };
+            double trial_res[3];
+            eval_residual(trial, rgb, trial_res);
+            double trial_cost = sqr(trial_res[0]) + sqr(trial_res[1]) +
+                                sqr(trial_res[2]);
+
+            if (trial_cost < cost) {
+                memcpy(coeffs, trial, sizeof(double) * 3);
+                memcpy(residual, trial_res, sizeof(double) * 3);
+                cost = trial_cost;
+                lambda = std::max(lambda * 0.5, 1e-12); /* step worked: trust the model more */
+                accepted = true;
+            } else {
+                lambda *= 10.0; /* step failed: trust the model less */
+                if (lambda > 1e12)
+                    break;
+            }
         }
-        double max = std::max(std::max(coeffs[0], coeffs[1]), coeffs[2]);
 
-        if (max > 200) {
-            for (int j = 0; j < 3; ++j)
-                coeffs[j] *= 200 / max;
-        }
-
-        if (r < 1e-6)
-            break;
+        if (!accepted)
+            break; /* converged, or no damped step can improve further */
     }
-    return std::sqrt(r);
+
+    return std::sqrt(cost);
 }
 
 static Gamut parse_gamut(const char *str) {
@@ -322,7 +366,7 @@ int main(int argc, char **argv) {
                     rgb[(l + 1) % 3] = x*b;
                     rgb[(l + 2) % 3] = y*b;
 
-                    double resid = gauss_newton(rgb, coeffs);
+                    double resid = LM(rgb, coeffs);
                     (void) resid;
 
                     double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
@@ -344,7 +388,7 @@ int main(int argc, char **argv) {
                     rgb[(l + 1) % 3] = x*b;
                     rgb[(l + 2) % 3] = y*b;
 
-                    double resid = gauss_newton(rgb, coeffs);
+                    double resid = LM(rgb, coeffs);
                     (void) resid;
 
                     double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
