@@ -15,6 +15,8 @@
 #include <atomic>
 #include <vector>
 
+#include "macros.h"
+
 /* Working precision for the optimizer. Single precision is sufficient for the
  * table's accuracy and lets the integration loops auto-vectorize to 4-wide SIMD
  * (define this to `double` to fall back to double precision). The reference
@@ -158,21 +160,8 @@ void init_tables(Gamut gamut) {
         xyz_whitepoint[channel] = (Float) whitepoint[channel];
 }
 
-/* Per-compiler hooks so the integration loops below can auto-vectorize. */
-#if defined(__clang__)
-#  define RGB2SPEC_FP_FAST
-#  define RGB2SPEC_FP_REASSOC _Pragma("clang fp reassociate(on) contract(fast)")
-#elif defined(__GNUC__)
-#  define RGB2SPEC_FP_FAST __attribute__((optimize("-fassociative-math", \
-       "-fno-signed-zeros", "-fno-trapping-math", "-fno-math-errno", "-ffp-contract=fast")))
-#  define RGB2SPEC_FP_REASSOC
-#else
-#  define RGB2SPEC_FP_FAST
-#  define RGB2SPEC_FP_REASSOC
-#endif
-#if defined(_MSC_VER)
-#  pragma float_control(precise, off, push)
-#endif
+/* Relax FP / enable vectorization for the integration loops below (see macros.h). */
+RGB2SPEC_FP_PUSH
 
 RGB2SPEC_FP_FAST
 void eval_residual(const Float *coeffs, const Float *rgb, Float *residual) {
@@ -198,36 +187,38 @@ void eval_residual(const Float *coeffs, const Float *rgb, Float *residual) {
         residual[j] -= out[j];
 }
 
-/// Analytic Jacobian of cie_lab() with respect to its RGB input, evaluated at 'rgb'.
-void cie_lab_jac(const Float rgb[3], Float jac[3][3]) {
-    Float Xw = xyz_whitepoint[0],
-          Yw = xyz_whitepoint[1],
-          Zw = xyz_whitepoint[2];
+/// Evaluate the CIELab color of the RGB input 'in', returning the value in 'lab'
+/// and its analytic Jacobian d(lab)/d(in) in 'jac'.
+void cie_lab_jac(const Float in[3], Float lab[3], Float jac[3][3]) {
+    Float wn[3] = { xyz_whitepoint[0], xyz_whitepoint[1], xyz_whitepoint[2] };
 
-    Float X = 0, Y = 0, Z = 0;
-    for (int j = 0; j < 3; ++j) {
-        X += rgb[j] * rgb_to_xyz[0][j];
-        Y += rgb[j] * rgb_to_xyz[1][j];
-        Z += rgb[j] * rgb_to_xyz[2][j];
+    Float xyz[3] = { 0, 0, 0 };
+    for (int a = 0; a < 3; ++a)
+        for (int j = 0; j < 3; ++j)
+            xyz[a] += in[j] * rgb_to_xyz[a][j];
+
+    Float fv[3], gd[3];      /* f(t) and f'(t)/w_n, with t = xyz / whitepoint */
+    for (int k = 0; k < 3; ++k) {
+        Float t = xyz[k] / wn[k], delta = Float(6.0 / 29.0);
+        if (t > delta*delta*delta) {
+            Float cr = std::cbrt(t);
+            fv[k] = cr;
+            gd[k] = Float(1.0 / 3.0) / (cr*cr * wn[k]);
+        } else {
+            fv[k] = t / (delta*delta * Float(3)) + Float(4.0 / 29.0);
+            gd[k] = Float(1) / (delta*delta * Float(3) * wn[k]);
+        }
     }
 
-    auto fp = [](Float t) -> Float {
-        Float delta = Float(6.0 / 29.0);
-        if (t > delta*delta*delta)
-            return Float(1.0 / 3.0) * std::pow(t, Float(-2.0 / 3.0));
-        else
-            return Float(1) / (delta*delta * Float(3));
-    };
-
-    Float gx = fp(X / Xw) / Xw,
-          gy = fp(Y / Yw) / Yw,
-          gz = fp(Z / Zw) / Zw;
+    lab[0] = Float(116) * fv[1] - Float(16);
+    lab[1] = Float(500) * (fv[0] - fv[1]);
+    lab[2] = Float(200) * (fv[1] - fv[2]);
 
     /* d Lab / d XYZ */
     Float g[3][3] = {
-        {        0,   Float(116) * gy,             0 },
-        { Float(500)*gx,  Float(-500) * gy,        0 },
-        {        0,   Float(200) * gy,  Float(-200)*gz }
+        {            0,   Float(116) * gd[1],                0 },
+        { Float(500)*gd[0],  Float(-500) * gd[1],            0 },
+        {            0,   Float(200) * gd[1],  Float(-200)*gd[2] }
     };
 
     /* d Lab / d RGB = (d Lab / d XYZ) * rgb_to_xyz */
@@ -271,17 +262,16 @@ void eval_residual_jac(const Float *coeffs, const Float *rgb,
         }
     }
 
-    /* Residual in CIELab */
-    Float out_lab[3] = { out[0], out[1], out[2] };
-    cie_lab(out_lab);
+    /* Residual in CIELab. The reproduced color needs both its Lab value and the
+       Lab Jacobian, so compute them together in one tristimulus pass. */
+    Float out_lab[3], lab_jac[3][3];
+    cie_lab_jac(out, out_lab, lab_jac);
     for (int j = 0; j < 3; ++j) residual[j] = rgb[j];
     cie_lab(residual);
     for (int j = 0; j < 3; ++j)
         residual[j] -= out_lab[j];
 
     /* Chain rule: d residual / d coeffs = -(d Lab / d out) * (d out / d coeffs) */
-    Float lab_jac[3][3];
-    cie_lab_jac(out, lab_jac);
     for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) {
             Float s = 0;
@@ -290,9 +280,7 @@ void eval_residual_jac(const Float *coeffs, const Float *rgb,
             jac[a][b] = -s;
         }
 }
-#if defined(_MSC_VER)
-#  pragma float_control(pop)
-#endif
+RGB2SPEC_FP_POP
 
 /**
  * Find the polynomial coefficients whose sigmoidal spectrum best reproduces the
@@ -506,6 +494,27 @@ int main(int argc, char **argv) {
     fwrite(scale, res * sizeof(float), 1, f);
 
     fwrite(out, sizeof(float)*bufsize, 1, f);
+
+    /* Append the forward-model block consumed by rgb2spec_fetch_opt():
+       nfine, then [lambda: nfine][rgb_tbl: 3*nfine][rgb_to_xyz: 9][whitepoint: 3]. */
+    {
+        uint32_t nfine = CIE_FINE_SAMPLES_PAD;
+        const double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
+        float *blk = new float[4*nfine + 12];
+        for (uint32_t i = 0; i < nfine; ++i)
+            blk[i] = float((lambda_tbl[i] - c0) * c1);
+        for (uint32_t i = 0; i < 3*nfine; ++i)
+            blk[nfine + i] = ((const float *) rgb_tbl)[i];
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b)
+                blk[4*nfine + a*3 + b] = (float) rgb_to_xyz[a][b];
+        for (int k = 0; k < 3; ++k)
+            blk[4*nfine + 9 + k] = (float) xyz_whitepoint[k];
+        fwrite(&nfine, sizeof(uint32_t), 1, f);
+        fwrite(blk, sizeof(float)*(4*nfine + 12), 1, f);
+        delete[] blk;
+    }
+
     delete[] out;
     delete[] scale;
     fclose(f);

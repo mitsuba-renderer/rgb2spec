@@ -22,6 +22,11 @@ typedef struct {
     uint32_t res;
     float *scale;
     float *data;
+
+    /* Forward model consumed by rgb2spec_fetch_opt(), laid out as one block:
+       [lambda: nfine][rgb_tbl: 3*nfine][rgb_to_xyz: 9][whitepoint: 3]. */
+    uint32_t nfine;
+    float *fwd;
 } RGB2Spec;
 
 /// Load a RGB2Spec model from disk
@@ -32,6 +37,10 @@ void rgb2spec_free(RGB2Spec *model);
 
 /// Convert an RGB value into a RGB2Spec coefficient representation
 void rgb2spec_fetch(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEFFS]);
+
+/// Like rgb2spec_fetch(), but performs one Levenberg-Marquardt step to refine
+/// the solution and mitigate interpolation error. ~16 times slower.
+void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEFFS]);
 
 /// Evaluate the model for a given wavelength
 float rgb2spec_eval_precise(float coeff[RGB2SPEC_N_COEFFS], float lambda);
