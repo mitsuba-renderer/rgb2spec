@@ -99,6 +99,26 @@ static int rgb2spec_find_interval(float *values, int size_, float x) {
     return rgb2spec_min(left, last_interval);
 }
 
+/// Try to use an analytic solution for monochromatic inputs or return 0 (failure)
+static int rgb2spec_fetch_mono(const float rgb[3], float out[RGB2SPEC_N_COEFFS]) {
+    if (rgb[0] != rgb[1] || rgb[1] != rgb[2])
+        return 0;
+
+    // Black/white map to +/- 8192, which evaluate to 0/1 in single precision.
+    // (we cannot use infinity as this would produce NaNs)
+    float v = rgb[0], r;
+    if (v <= 0.f)
+        r = -8192.f;
+    else if (v >= 1.f)
+        r = 8192.f;
+    else
+        r = (v - .5f) / sqrtf(v * (1.f - v));
+
+    out[0] = out[1] = 0.f;
+    out[2] = r;
+    return 1;
+}
+
 /// Convert an RGB value into a RGB2Spec coefficient representation
 void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]) {
     /* Determine largest RGB component */
@@ -106,6 +126,10 @@ void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]
     float rgb[3];
     for (int j = 0; j < 3; ++j)
         rgb[j] = rgb2spec_max(rgb2spec_min(rgb_[j], 1.f), 0.f);
+
+    // Use a closed form solution for monochromatic inputs
+    if (rgb2spec_fetch_mono(rgb, out))
+        return;
 
     for (int j = 1; j < 3; ++j)
         if (rgb[j] >= rgb[i])
@@ -266,6 +290,15 @@ static float rgb2spec_opt_cost(int n, const float *lam, const float *W,
 RGB2SPEC_FP_FAST
 void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEFFS]) {
     RGB2SPEC_FP_REASSOC
+
+    float tgt[3];
+    for (int j = 0; j < 3; ++j)
+        tgt[j] = rgb2spec_max(rgb2spec_min(rgb[j], 1.f), 0.f);
+
+    // Use a closed form solution for monochromatic inputs
+    if (rgb2spec_fetch_mono(tgt, out))
+        return;
+
     rgb2spec_fetch(model, rgb, out);
 
     const float c0 = 360.f, c1 = 1.f / (830.f - 360.f);
@@ -281,10 +314,6 @@ void rgb2spec_fetch_opt(RGB2Spec *model, float rgb[3], float out[RGB2SPEC_N_COEF
     const float *W   = model->fwd + n;          /* W[j*n + i] = rgb_tbl[j][i] */
     const float *r2x = model->fwd + 4*n;
     const float *wp  = model->fwd + 4*n + 9;
-
-    float tgt[3];
-    for (int j = 0; j < 3; ++j)
-        tgt[j] = rgb2spec_max(rgb2spec_min(rgb[j], 1.f), 0.f);
 
     /* Single pass: reproduced color and its Jacobian w.r.t. the coefficients. */
     float orgb[3] = { 0, 0, 0 };
