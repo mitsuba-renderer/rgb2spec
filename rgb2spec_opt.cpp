@@ -15,18 +15,30 @@
 #include <atomic>
 #include <vector>
 
+/* Working precision for the optimizer. Single precision is sufficient for the
+ * table's accuracy and lets the integration loops auto-vectorize to 4-wide SIMD
+ * (define this to `double` to fall back to double precision). The reference
+ * colorimetric data in cie1931.h deliberately stays double. */
+#define Float float
+
 #include "details/cie1931.h"
 #include "details/lu.h"
 
 /// Discretization of quadrature scheme
 #define CIE_FINE_SAMPLES ((CIE_SAMPLES - 1) * 3 + 1)
 
-/// Precomputed tables for fast spectral -> RGB conversion
-double lambda_tbl[CIE_FINE_SAMPLES],
-       rgb_tbl[3][CIE_FINE_SAMPLES],
-       rgb_to_xyz[3][3],
-       xyz_to_rgb[3][3],
-       xyz_whitepoint[3];
+/// Sample count padded to a multiple of 16 (the widest SIMD lane count for
+/// float) so the quadrature loop vectorizes with no scalar remainder. The extra
+/// entries stay zero and therefore contribute nothing to the integral.
+#define CIE_FINE_SAMPLES_PAD (((CIE_FINE_SAMPLES + 15) / 16) * 16)
+
+/// Precomputed tables for fast spectral -> RGB conversion. 64-byte aligned (and
+/// each rgb_tbl row is a multiple of 64 bytes) for aligned AVX-512 loads.
+alignas(64) Float lambda_tbl[CIE_FINE_SAMPLES_PAD];
+alignas(64) Float rgb_tbl[3][CIE_FINE_SAMPLES_PAD];
+Float rgb_to_xyz[3][3],
+      xyz_to_rgb[3][3],
+      xyz_whitepoint[3];
 
 /// Currently supported gamuts
 enum Gamut {
@@ -39,18 +51,18 @@ enum Gamut {
     NO_GAMUT,
 };
 
-double sigmoid(double x) {
-    return 0.5 * x / std::sqrt(1.0 + x * x) + 0.5;
+Float sigmoid(Float x) {
+    return Float(0.5) * x / std::sqrt(Float(1) + x * x) + Float(0.5);
 }
 
-double smoothstep(double x) {
-    return x * x * (3.0 - 2.0 * x);
+Float smoothstep(Float x) {
+    return x * x * (Float(3) - Float(2) * x);
 }
 
-double sqr(double x) { return x * x; }
+Float sqr(Float x) { return x * x; }
 
-void cie_lab(double *p) {
-    double X = 0.0, Y = 0.0, Z = 0.0,
+void cie_lab(Float *p) {
+    Float X = 0, Y = 0, Z = 0,
       Xw = xyz_whitepoint[0],
       Yw = xyz_whitepoint[1],
       Zw = xyz_whitepoint[2];
@@ -61,17 +73,17 @@ void cie_lab(double *p) {
         Z += p[j] * rgb_to_xyz[2][j];
     }
 
-    auto f = [](double t) -> double {
-        double delta = 6.0 / 29.0;
+    auto f = [](Float t) -> Float {
+        Float delta = Float(6.0 / 29.0);
         if (t > delta*delta*delta)
-            return cbrt(t);
+            return std::cbrt(t);
         else
-            return t / (delta*delta * 3.0) + (4.0 / 29.0);
+            return t / (delta*delta * Float(3)) + Float(4.0 / 29.0);
     };
 
-    p[0] = 116.0 * f(Y / Yw) - 16.0;
-    p[1] = 500.0 * (f(X / Xw) - f(Y / Yw));
-    p[2] = 200.0 * (f(Y / Yw) - f(Z / Zw));
+    p[0] = Float(116) * f(Y / Yw) - Float(16);
+    p[1] = Float(500) * (f(X / Xw) - f(Y / Yw));
+    p[2] = Float(200) * (f(Y / Yw) - f(Z / Zw));
 }
 
 /**
@@ -84,56 +96,36 @@ void cie_lab(double *p) {
  * four positions per segment. While the CIE curves and illuminant spectrum are
  * linear over the segment, the reflectance could have arbitrary behavior,
  * hence the extra precations.
+ *
+ * The accumulation is done in double precision (reference data is double) and
+ * the results are stored into the single-precision working tables.
  */
 void init_tables(Gamut gamut) {
     memset(rgb_tbl, 0, sizeof(rgb_tbl));
-    memset(xyz_whitepoint, 0, sizeof(xyz_whitepoint));
 
     double h = (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN) / (CIE_FINE_SAMPLES - 1);
 
     const double *illuminant = nullptr;
+    const double (*to_rgb)[3] = nullptr, (*to_xyz)[3] = nullptr;
 
     switch (gamut) {
-        case SRGB:
-            illuminant = cie_d65;
-            memcpy(xyz_to_rgb, xyz_to_srgb, sizeof(double) * 9);
-            memcpy(rgb_to_xyz, srgb_to_xyz, sizeof(double) * 9);
-            break;
-
-        case ERGB:
-            illuminant = cie_e;
-            memcpy(xyz_to_rgb, xyz_to_ergb, sizeof(double) * 9);
-            memcpy(rgb_to_xyz, ergb_to_xyz, sizeof(double) * 9);
-            break;
-
-        case XYZ:
-            illuminant = cie_e;
-            memcpy(xyz_to_rgb, xyz_to_xyz, sizeof(double) * 9);
-            memcpy(rgb_to_xyz, xyz_to_xyz, sizeof(double) * 9);
-            break;
-
-        case ProPhotoRGB:
-            illuminant = cie_d50;
-            memcpy(xyz_to_rgb, xyz_to_prophoto_rgb, sizeof(double) * 9);
-            memcpy(rgb_to_xyz, prophoto_rgb_to_xyz, sizeof(double) * 9);
-            break;
-
-        case ACES2065_1:
-            illuminant = cie_d60;
-            memcpy(xyz_to_rgb, xyz_to_aces2065_1, sizeof(double) * 9);
-            memcpy(rgb_to_xyz, aces2065_1_to_xyz, sizeof(double) * 9);
-            break;
-
-        case REC2020:
-            illuminant = cie_d65;
-            memcpy(xyz_to_rgb, xyz_to_rec2020, sizeof(double) * 9);
-            memcpy(rgb_to_xyz, rec2020_to_xyz, sizeof(double) * 9);
-            break;
-
-        default:
-            throw std::runtime_error("init_gamut(): invalid/unsupported gamut.");
+        case SRGB:        illuminant = cie_d65; to_rgb = xyz_to_srgb;          to_xyz = srgb_to_xyz;          break;
+        case ERGB:        illuminant = cie_e;   to_rgb = xyz_to_ergb;          to_xyz = ergb_to_xyz;          break;
+        case XYZ:         illuminant = cie_e;   to_rgb = xyz_to_xyz;           to_xyz = xyz_to_xyz;           break;
+        case ProPhotoRGB: illuminant = cie_d50; to_rgb = xyz_to_prophoto_rgb;  to_xyz = prophoto_rgb_to_xyz;  break;
+        case ACES2065_1:  illuminant = cie_d60; to_rgb = xyz_to_aces2065_1;    to_xyz = aces2065_1_to_xyz;    break;
+        case REC2020:     illuminant = cie_d65; to_rgb = xyz_to_rec2020;       to_xyz = rec2020_to_xyz;       break;
+        default: throw std::runtime_error("init_gamut(): invalid/unsupported gamut.");
     }
 
+    /* Reference matrices are double; convert element-wise into the Float tables */
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) {
+            xyz_to_rgb[a][b] = (Float) to_rgb[a][b];
+            rgb_to_xyz[a][b] = (Float) to_xyz[a][b];
+        }
+
+    double whitepoint[3] = { 0.0, 0.0, 0.0 };
     for (int i = 0; i < CIE_FINE_SAMPLES; ++i) {
         double lambda = CIE_LAMBDA_MIN + i * h;
 
@@ -146,42 +138,60 @@ void init_tables(Gamut gamut) {
         if (i == 0 || i == CIE_FINE_SAMPLES - 1)
             ;
         else if ((i - 1) % 3 == 2)
-            weight *= 2.f;
+            weight *= 2.0;
         else
-            weight *= 3.f;
+            weight *= 3.0;
 
-        lambda_tbl[i] = lambda;
-        for (int k = 0; k < 3; ++k)
+        lambda_tbl[i] = (Float) lambda;
+        for (int k = 0; k < 3; ++k) {
+            double acc = 0.0;
             for (int j = 0; j < 3; ++j)
-                rgb_tbl[k][i] += xyz_to_rgb[k][j] * xyz[j] * I * weight;
+                acc += to_rgb[k][j] * xyz[j] * I * weight;
+            rgb_tbl[k][i] = (Float) acc;
+        }
 
         for (int channel = 0; channel < 3; ++channel)
-            xyz_whitepoint[channel] += xyz[channel] * I * weight;
+            whitepoint[channel] += xyz[channel] * I * weight;
     }
+
+    for (int channel = 0; channel < 3; ++channel)
+        xyz_whitepoint[channel] = (Float) whitepoint[channel];
 }
 
-void eval_residual(const double *coeffs, const double *rgb, double *residual) {
-    double out[3] = { 0.0, 0.0, 0.0 };
+/* Per-compiler hooks so the integration loops below can auto-vectorize. */
+#if defined(__clang__)
+#  define RGB2SPEC_FP_FAST
+#  define RGB2SPEC_FP_REASSOC _Pragma("clang fp reassociate(on) contract(fast)")
+#elif defined(__GNUC__)
+#  define RGB2SPEC_FP_FAST __attribute__((optimize("-fassociative-math", \
+       "-fno-signed-zeros", "-fno-trapping-math", "-fno-math-errno", "-ffp-contract=fast")))
+#  define RGB2SPEC_FP_REASSOC
+#else
+#  define RGB2SPEC_FP_FAST
+#  define RGB2SPEC_FP_REASSOC
+#endif
+#if defined(_MSC_VER)
+#  pragma float_control(precise, off, push)
+#endif
 
-    for (int i = 0; i < CIE_FINE_SAMPLES; ++i) {
-        /* Scale lambda to 0..1 range */
-        double lambda = (lambda_tbl[i] - CIE_LAMBDA_MIN) /
-                        (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN);
+RGB2SPEC_FP_FAST
+void eval_residual(const Float *coeffs, const Float *rgb, Float *residual) {
+    RGB2SPEC_FP_REASSOC
+    Float out[3] = { 0, 0, 0 };
+    const Float lo  = (Float) CIE_LAMBDA_MIN,
+                inv = (Float) (1.0 / (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN));
+    Float c0 = coeffs[0], c1 = coeffs[1], c2 = coeffs[2];
 
-        /* Polynomial */
-        double x = 0.0;
-        for (int coeff = 0; coeff < 3; ++coeff)
-            x = x * lambda + coeffs[coeff];
+    for (int i = 0; i < CIE_FINE_SAMPLES_PAD; ++i) {
+        Float lambda = (lambda_tbl[i] - lo) * inv;          /* scale to 0..1 */
+        Float x = (c0 * lambda + c1) * lambda + c2;         /* polynomial */
+        Float s = Float(0.5) * x / std::sqrt(Float(1) + x * x) + Float(0.5);
 
-        /* Sigmoid */
-        double s = sigmoid(x);
-
-        /* Integrate against precomputed curves */
         for (int j = 0; j < 3; ++j)
             out[j] += rgb_tbl[j][i] * s;
     }
     cie_lab(out);
-    memcpy(residual, rgb, sizeof(double) * 3);
+    for (int j = 0; j < 3; ++j) residual[j] = rgb[j];
     cie_lab(residual);
 
     for (int j = 0; j < 3; ++j)
@@ -189,41 +199,41 @@ void eval_residual(const double *coeffs, const double *rgb, double *residual) {
 }
 
 /// Analytic Jacobian of cie_lab() with respect to its RGB input, evaluated at 'rgb'.
-void cie_lab_jac(const double rgb[3], double jac[3][3]) {
-    double Xw = xyz_whitepoint[0],
-           Yw = xyz_whitepoint[1],
-           Zw = xyz_whitepoint[2];
+void cie_lab_jac(const Float rgb[3], Float jac[3][3]) {
+    Float Xw = xyz_whitepoint[0],
+          Yw = xyz_whitepoint[1],
+          Zw = xyz_whitepoint[2];
 
-    double X = 0.0, Y = 0.0, Z = 0.0;
+    Float X = 0, Y = 0, Z = 0;
     for (int j = 0; j < 3; ++j) {
         X += rgb[j] * rgb_to_xyz[0][j];
         Y += rgb[j] * rgb_to_xyz[1][j];
         Z += rgb[j] * rgb_to_xyz[2][j];
     }
 
-    auto fp = [](double t) -> double {
-        double delta = 6.0 / 29.0;
+    auto fp = [](Float t) -> Float {
+        Float delta = Float(6.0 / 29.0);
         if (t > delta*delta*delta)
-            return (1.0 / 3.0) * std::pow(t, -2.0 / 3.0);
+            return Float(1.0 / 3.0) * std::pow(t, Float(-2.0 / 3.0));
         else
-            return 1.0 / (delta*delta * 3.0);
+            return Float(1) / (delta*delta * Float(3));
     };
 
-    double gx = fp(X / Xw) / Xw,
-           gy = fp(Y / Yw) / Yw,
-           gz = fp(Z / Zw) / Zw;
+    Float gx = fp(X / Xw) / Xw,
+          gy = fp(Y / Yw) / Yw,
+          gz = fp(Z / Zw) / Zw;
 
     /* d Lab / d XYZ */
-    double g[3][3] = {
-        {      0.0,   116.0 * gy,        0.0 },
-        { 500.0*gx,  -500.0 * gy,        0.0 },
-        {      0.0,   200.0 * gy,  -200.0*gz }
+    Float g[3][3] = {
+        {        0,   Float(116) * gy,             0 },
+        { Float(500)*gx,  Float(-500) * gy,        0 },
+        {        0,   Float(200) * gy,  Float(-200)*gz }
     };
 
     /* d Lab / d RGB = (d Lab / d XYZ) * rgb_to_xyz */
     for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) {
-            double s = 0.0;
+            Float s = 0;
             for (int k = 0; k < 3; ++k)
                 s += g[a][k] * rgb_to_xyz[k][b];
             jac[a][b] = s;
@@ -231,57 +241,58 @@ void cie_lab_jac(const double rgb[3], double jac[3][3]) {
 }
 
 /// Evaluate the residual together with its Jacobian in a single integration pass.
-void eval_residual_jac(const double *coeffs, const double *rgb,
-                       double *residual, double jac[3][3]) {
-    double out[3] = { 0.0, 0.0, 0.0 };
-    double dout[3][3] = { { 0.0, 0.0, 0.0 },
-                          { 0.0, 0.0, 0.0 },
-                          { 0.0, 0.0, 0.0 } }; /* d out[j] / d coeffs[a] */
+RGB2SPEC_FP_FAST
+void eval_residual_jac(const Float *coeffs, const Float *rgb,
+                       Float *residual, Float jac[3][3]) {
+    RGB2SPEC_FP_REASSOC
+    Float out[3] = { 0, 0, 0 };
+    Float dout[3][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }; /* d out[j] / d coeffs[a] */
+    const Float lo  = (Float) CIE_LAMBDA_MIN,
+                inv = (Float) (1.0 / (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN));
+    Float c0 = coeffs[0], c1 = coeffs[1], c2 = coeffs[2];
 
-    for (int i = 0; i < CIE_FINE_SAMPLES; ++i) {
-        /* Scale lambda to 0..1 range */
-        double lambda = (lambda_tbl[i] - CIE_LAMBDA_MIN) /
-                        (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN);
-
-        /* Polynomial and its derivatives w.r.t. the coefficients */
-        double x = (coeffs[0] * lambda + coeffs[1]) * lambda + coeffs[2];
-        double dx[3] = { lambda * lambda, lambda, 1.0 };
+    for (int i = 0; i < CIE_FINE_SAMPLES_PAD; ++i) {
+        Float lambda = (lambda_tbl[i] - lo) * inv;
+        Float x = (c0 * lambda + c1) * lambda + c2;
+        Float dx0 = lambda * lambda, dx1 = lambda;            /* dP/dcoeffs */
 
         /* Sigmoid and its derivative (both share q = 1 / sqrt(1 + x^2)) */
-        double q  = 1.0 / std::sqrt(1.0 + x * x);
-        double s  = 0.5 * x * q + 0.5;
-        double sp = 0.5 * q * q * q;
+        Float q  = Float(1) / std::sqrt(Float(1) + x * x);
+        Float s  = Float(0.5) * x * q + Float(0.5);
+        Float sp = Float(0.5) * q * q * q;
 
-        /* Integrate the curves and their coefficient sensitivities */
         for (int j = 0; j < 3; ++j) {
-            double w = rgb_tbl[j][i];
+            Float w = rgb_tbl[j][i];
             out[j] += w * s;
-            double wsp = w * sp;
-            dout[j][0] += wsp * dx[0];
-            dout[j][1] += wsp * dx[1];
-            dout[j][2] += wsp * dx[2];
+            Float wsp = w * sp;
+            dout[j][0] += wsp * dx0;
+            dout[j][1] += wsp * dx1;
+            dout[j][2] += wsp;
         }
     }
 
     /* Residual in CIELab */
-    double out_lab[3] = { out[0], out[1], out[2] };
+    Float out_lab[3] = { out[0], out[1], out[2] };
     cie_lab(out_lab);
-    memcpy(residual, rgb, sizeof(double) * 3);
+    for (int j = 0; j < 3; ++j) residual[j] = rgb[j];
     cie_lab(residual);
     for (int j = 0; j < 3; ++j)
         residual[j] -= out_lab[j];
 
     /* Chain rule: d residual / d coeffs = -(d Lab / d out) * (d out / d coeffs) */
-    double lab_jac[3][3];
+    Float lab_jac[3][3];
     cie_lab_jac(out, lab_jac);
     for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) {
-            double s = 0.0;
+            Float s = 0;
             for (int k = 0; k < 3; ++k)
                 s += lab_jac[a][k] * dout[k][b];
             jac[a][b] = -s;
         }
 }
+#if defined(_MSC_VER)
+#  pragma float_control(pop)
+#endif
 
 /**
  * Find the polynomial coefficients whose sigmoidal spectrum best reproduces the
@@ -294,19 +305,19 @@ void eval_residual_jac(const double *coeffs, const double *rgb,
  * as the spectrum saturates; there the adaptive 'lambda' damping regularizes the
  * step so the method settles at the closest achievable color instead of diverging.
  */
-double LM(const double rgb[3], double coeffs[3], int it = 15) {
-    double residual[3], jac[3][3];
+Float LM(const Float rgb[3], Float coeffs[3], int it = 15) {
+    Float residual[3], jac[3][3];
     eval_residual_jac(coeffs, rgb, residual, jac);
-    double cost = sqr(residual[0]) + sqr(residual[1]) + sqr(residual[2]);
+    Float cost = sqr(residual[0]) + sqr(residual[1]) + sqr(residual[2]);
 
-    double lambda = 1e-3;
+    Float lambda = Float(1e-3);
 
-    for (int i = 0; i < it && cost > 1e-12; ++i) {
+    for (int i = 0; i < it && cost > Float(1e-12); ++i) {
         /* Assemble the normal equations: A = J^T J,  g = J^T residual */
-        double A[3][3], g[3] = { 0.0, 0.0, 0.0 };
+        Float A[3][3], g[3] = { 0, 0, 0 };
         for (int a = 0; a < 3; ++a) {
             for (int b = 0; b < 3; ++b) {
-                double s = 0.0;
+                Float s = 0;
                 for (int k = 0; k < 3; ++k)
                     s += jac[k][a] * jac[k][b];
                 A[a][b] = s;
@@ -318,38 +329,38 @@ double LM(const double rgb[3], double coeffs[3], int it = 15) {
         /* Try damped steps, increasing 'lambda', until one decreases the cost */
         bool accepted = false;
         for (int t = 0; t < 10 && !accepted; ++t) {
-            double M0[3], M1[3], M2[3], *M[3] = { M0, M1, M2 };
+            Float M0[3], M1[3], M2[3], *M[3] = { M0, M1, M2 };
             for (int a = 0; a < 3; ++a)
                 for (int b = 0; b < 3; ++b)
-                    M[a][b] = A[a][b] + (a == b ? lambda : 0.0); /* A + lambda*I */
+                    M[a][b] = A[a][b] + (a == b ? lambda : Float(0)); /* A + lambda*I */
 
             int P[4];
-            if (LUPDecompose(M, 3, 1e-30, P) != 1) {
-                lambda *= 10.0; /* singular even when damped -> damp harder */
+            if (LUPDecompose(M, 3, Float(1e-30), P) != 1) {
+                lambda *= Float(10); /* singular even when damped -> damp harder */
                 continue;
             }
 
             /* Solve (A + lambda*I) step = g;  the LM update is coeffs -= step.
                Trials only need the cost, so use the cheaper residual-only eval. */
-            double step[3];
+            Float step[3];
             LUPSolve(M, P, g, 3, step);
 
-            double trial[3] = { coeffs[0] - step[0],
-                                coeffs[1] - step[1],
-                                coeffs[2] - step[2] };
-            double trial_res[3];
+            Float trial[3] = { coeffs[0] - step[0],
+                               coeffs[1] - step[1],
+                               coeffs[2] - step[2] };
+            Float trial_res[3];
             eval_residual(trial, rgb, trial_res);
-            double trial_cost = sqr(trial_res[0]) + sqr(trial_res[1]) +
-                                sqr(trial_res[2]);
+            Float trial_cost = sqr(trial_res[0]) + sqr(trial_res[1]) +
+                               sqr(trial_res[2]);
 
             if (trial_cost < cost) {
-                memcpy(coeffs, trial, sizeof(double) * 3);
+                memcpy(coeffs, trial, sizeof(Float) * 3);
                 cost = trial_cost;
-                lambda = std::max(lambda * 0.5, 1e-12); /* step worked: trust the model more */
+                lambda = std::max(lambda * Float(0.5), Float(1e-12)); /* step worked: trust the model more */
                 accepted = true;
             } else {
-                lambda *= 10.0; /* step failed: trust the model less */
-                if (lambda > 1e12)
+                lambda *= Float(10); /* step failed: trust the model less */
+                if (lambda > Float(1e12))
                     break;
             }
         }
@@ -404,7 +415,7 @@ int main(int argc, char **argv) {
 
     float *scale = new float[res];
     for (int k = 0; k < res; ++k)
-        scale[k] = (float) smoothstep(smoothstep(k / double(res - 1)));
+        scale[k] = (float) smoothstep(smoothstep(Float(k) / Float(res - 1)));
 
     size_t bufsize = 3*3*res*res*res;
     float *out = new float[bufsize];
@@ -412,46 +423,48 @@ int main(int argc, char **argv) {
     /* Each (l, j) slice is an independent unit of work: distinct slices write to
        disjoint regions of 'out', so the tasks need no synchronization. */
     auto process = [&](int l, int j) {
-        const double y = j / double(res - 1);
+        const Float y = Float(j) / Float(res - 1);
         printf(".");
         fflush(stdout);
         for (int i = 0; i < res; ++i) {
-            const double x = i / double(res - 1);
-            double coeffs[3], rgb[3];
-            memset(coeffs, 0, sizeof(double)*3);
+            const Float x = Float(i) / Float(res - 1);
+            Float coeffs[3], rgb[3];
+            memset(coeffs, 0, sizeof(Float)*3);
 
             int start = res / 5;
 
             for (int k = start; k < res; ++k) {
-                double b = (double) scale[k];
+                Float b = scale[k];
 
                 rgb[l] = b;
                 rgb[(l + 1) % 3] = x*b;
                 rgb[(l + 2) % 3] = y*b;
 
-                double resid = LM(rgb, coeffs);
+                Float resid = LM(rgb, coeffs);
                 (void) resid;
 
+                /* Remap polynomial from the [0,1] domain back to wavelength (nm);
+                   kept in double precision since it is one store per node. */
                 double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
                 double A = coeffs[0], B = coeffs[1], C = coeffs[2];
 
                 int idx = ((l*res + k) * res + j)*res+i;
 
-                out[3*idx + 0] = float(A*(sqr(c1)));
-                out[3*idx + 1] = float(B*c1 - 2*A*c0*(sqr(c1)));
-                out[3*idx + 2] = float(C - B*c0*c1 + A*(sqr(c0*c1)));
+                out[3*idx + 0] = float(A*(c1*c1));
+                out[3*idx + 1] = float(B*c1 - 2*A*c0*(c1*c1));
+                out[3*idx + 2] = float(C - B*c0*c1 + A*(c0*c1)*(c0*c1));
                 //out[3*idx + 2] = resid;
             }
 
-            memset(coeffs, 0, sizeof(double)*3);
+            memset(coeffs, 0, sizeof(Float)*3);
             for (int k = start; k>=0; --k) {
-                double b = (double) scale[k];
+                Float b = scale[k];
 
                 rgb[l] = b;
                 rgb[(l + 1) % 3] = x*b;
                 rgb[(l + 2) % 3] = y*b;
 
-                double resid = LM(rgb, coeffs);
+                Float resid = LM(rgb, coeffs);
                 (void) resid;
 
                 double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
@@ -459,9 +472,9 @@ int main(int argc, char **argv) {
 
                 int idx = ((l*res + k) * res + j)*res+i;
 
-                out[3*idx + 0] = float(A*(sqr(c1)));
-                out[3*idx + 1] = float(B*c1 - 2*A*c0*(sqr(c1)));
-                out[3*idx + 2] = float(C - B*c0*c1 + A*(sqr(c0*c1)));
+                out[3*idx + 0] = float(A*(c1*c1));
+                out[3*idx + 1] = float(B*c1 - 2*A*c0*(c1*c1));
+                out[3*idx + 2] = float(C - B*c0*c1 + A*(c0*c1)*(c0*c1));
                 //out[3*idx + 2] = resid;
             }
         }

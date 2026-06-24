@@ -1,5 +1,10 @@
 // LU decomposition & triangular solving code lifted from Wikipedia
 
+// Scalar type (defaults to double; the optimizer defines it to `float`).
+#ifndef Float
+#  define Float double
+#endif
+
 /* INPUT: A - array of pointers to rows of a square matrix having dimension N
  *        Tol - small tolerance number to detect failure when the matrix is near degenerate
  * OUTPUT: Matrix A is changed, it contains both matrices L-E and U as A=(L-E)+U such that P*A=L*U.
@@ -7,10 +12,10 @@
  *        containing column indexes where the permutation matrix has "1". The last element P[N]=S+N,
  *        where S is the number of row exchanges needed for determinant computation, det(P)=(-1)^S
  */
-int LUPDecompose(double **A, int N, double Tol, int *P) {
+int LUPDecompose(Float **A, int N, Float Tol, int *P) {
 
     int i, j, k, imax;
-    double maxA, *ptr, absA;
+    Float maxA, *ptr, absA;
 
     for (i = 0; i <= N; i++)
         P[i] = i; //Unit permutation matrix, P[N] initialized with N
@@ -56,7 +61,7 @@ int LUPDecompose(double **A, int N, double Tol, int *P) {
 /* INPUT: A,P filled in LUPDecompose; b - rhs vector; N - dimension
  * OUTPUT: x - solution vector of A*x=b
  */
-void LUPSolve(double **A, int *P, double *b, int N, double *x) {
+void LUPSolve(Float **A, int *P, Float *b, int N, Float *x) {
 
     for (int i = 0; i < N; i++) {
         x[i] = b[P[i]];
