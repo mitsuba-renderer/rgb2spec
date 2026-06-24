@@ -20,7 +20,6 @@
 
 /// Discretization of quadrature scheme
 #define CIE_FINE_SAMPLES ((CIE_SAMPLES - 1) * 3 + 1)
-#define RGB2SPEC_EPSILON 1e-4
 
 /// Precomputed tables for fast spectral -> RGB conversion
 double lambda_tbl[CIE_FINE_SAMPLES],
@@ -189,21 +188,99 @@ void eval_residual(const double *coeffs, const double *rgb, double *residual) {
         residual[j] -= out[j];
 }
 
-void eval_jacobian(const double *coeffs, const double *rgb, double **jac) {
-    double r0[3], r1[3], tmp[3];
+/// Analytic Jacobian of cie_lab() with respect to its RGB input, evaluated at 'rgb'.
+void cie_lab_jac(const double rgb[3], double jac[3][3]) {
+    double Xw = xyz_whitepoint[0],
+           Yw = xyz_whitepoint[1],
+           Zw = xyz_whitepoint[2];
 
-    for (int i = 0; i < 3; ++i) {
-        memcpy(tmp, coeffs, sizeof(double) * 3);
-        tmp[i] -= RGB2SPEC_EPSILON;
-        eval_residual(tmp, rgb, r0);
-
-        memcpy(tmp, coeffs, sizeof(double) * 3);
-        tmp[i] += RGB2SPEC_EPSILON;
-        eval_residual(tmp, rgb, r1);
-
-        for (int j = 0; j < 3; ++j)
-            jac[j][i] = (r1[j] - r0[j]) * 1.0 / (2 * RGB2SPEC_EPSILON);
+    double X = 0.0, Y = 0.0, Z = 0.0;
+    for (int j = 0; j < 3; ++j) {
+        X += rgb[j] * rgb_to_xyz[0][j];
+        Y += rgb[j] * rgb_to_xyz[1][j];
+        Z += rgb[j] * rgb_to_xyz[2][j];
     }
+
+    auto fp = [](double t) -> double {
+        double delta = 6.0 / 29.0;
+        if (t > delta*delta*delta)
+            return (1.0 / 3.0) * std::pow(t, -2.0 / 3.0);
+        else
+            return 1.0 / (delta*delta * 3.0);
+    };
+
+    double gx = fp(X / Xw) / Xw,
+           gy = fp(Y / Yw) / Yw,
+           gz = fp(Z / Zw) / Zw;
+
+    /* d Lab / d XYZ */
+    double g[3][3] = {
+        {      0.0,   116.0 * gy,        0.0 },
+        { 500.0*gx,  -500.0 * gy,        0.0 },
+        {      0.0,   200.0 * gy,  -200.0*gz }
+    };
+
+    /* d Lab / d RGB = (d Lab / d XYZ) * rgb_to_xyz */
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 3; ++k)
+                s += g[a][k] * rgb_to_xyz[k][b];
+            jac[a][b] = s;
+        }
+}
+
+/// Evaluate the residual together with its Jacobian in a single integration pass.
+void eval_residual_jac(const double *coeffs, const double *rgb,
+                       double *residual, double jac[3][3]) {
+    double out[3] = { 0.0, 0.0, 0.0 };
+    double dout[3][3] = { { 0.0, 0.0, 0.0 },
+                          { 0.0, 0.0, 0.0 },
+                          { 0.0, 0.0, 0.0 } }; /* d out[j] / d coeffs[a] */
+
+    for (int i = 0; i < CIE_FINE_SAMPLES; ++i) {
+        /* Scale lambda to 0..1 range */
+        double lambda = (lambda_tbl[i] - CIE_LAMBDA_MIN) /
+                        (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN);
+
+        /* Polynomial and its derivatives w.r.t. the coefficients */
+        double x = (coeffs[0] * lambda + coeffs[1]) * lambda + coeffs[2];
+        double dx[3] = { lambda * lambda, lambda, 1.0 };
+
+        /* Sigmoid and its derivative (both share q = 1 / sqrt(1 + x^2)) */
+        double q  = 1.0 / std::sqrt(1.0 + x * x);
+        double s  = 0.5 * x * q + 0.5;
+        double sp = 0.5 * q * q * q;
+
+        /* Integrate the curves and their coefficient sensitivities */
+        for (int j = 0; j < 3; ++j) {
+            double w = rgb_tbl[j][i];
+            out[j] += w * s;
+            double wsp = w * sp;
+            dout[j][0] += wsp * dx[0];
+            dout[j][1] += wsp * dx[1];
+            dout[j][2] += wsp * dx[2];
+        }
+    }
+
+    /* Residual in CIELab */
+    double out_lab[3] = { out[0], out[1], out[2] };
+    cie_lab(out_lab);
+    memcpy(residual, rgb, sizeof(double) * 3);
+    cie_lab(residual);
+    for (int j = 0; j < 3; ++j)
+        residual[j] -= out_lab[j];
+
+    /* Chain rule: d residual / d coeffs = -(d Lab / d out) * (d out / d coeffs) */
+    double lab_jac[3][3];
+    cie_lab_jac(out, lab_jac);
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 3; ++k)
+                s += lab_jac[a][k] * dout[k][b];
+            jac[a][b] = -s;
+        }
 }
 
 /**
@@ -218,27 +295,24 @@ void eval_jacobian(const double *coeffs, const double *rgb, double **jac) {
  * step so the method settles at the closest achievable color instead of diverging.
  */
 double LM(const double rgb[3], double coeffs[3], int it = 15) {
-    double residual[3];
-    eval_residual(coeffs, rgb, residual);
+    double residual[3], jac[3][3];
+    eval_residual_jac(coeffs, rgb, residual, jac);
     double cost = sqr(residual[0]) + sqr(residual[1]) + sqr(residual[2]);
 
     double lambda = 1e-3;
 
     for (int i = 0; i < it && cost > 1e-12; ++i) {
-        double J0[3], J1[3], J2[3], *J[3] = { J0, J1, J2 };
-        eval_jacobian(coeffs, rgb, J); /* J[k][a] = d residual[k] / d coeffs[a] */
-
         /* Assemble the normal equations: A = J^T J,  g = J^T residual */
         double A[3][3], g[3] = { 0.0, 0.0, 0.0 };
         for (int a = 0; a < 3; ++a) {
             for (int b = 0; b < 3; ++b) {
                 double s = 0.0;
                 for (int k = 0; k < 3; ++k)
-                    s += J[k][a] * J[k][b];
+                    s += jac[k][a] * jac[k][b];
                 A[a][b] = s;
             }
             for (int k = 0; k < 3; ++k)
-                g[a] += J[k][a] * residual[k];
+                g[a] += jac[k][a] * residual[k];
         }
 
         /* Try damped steps, increasing 'lambda', until one decreases the cost */
@@ -255,7 +329,8 @@ double LM(const double rgb[3], double coeffs[3], int it = 15) {
                 continue;
             }
 
-            /* Solve (A + lambda*I) step = g;  the LM update is coeffs -= step */
+            /* Solve (A + lambda*I) step = g;  the LM update is coeffs -= step.
+               Trials only need the cost, so use the cheaper residual-only eval. */
             double step[3];
             LUPSolve(M, P, g, 3, step);
 
@@ -269,7 +344,6 @@ double LM(const double rgb[3], double coeffs[3], int it = 15) {
 
             if (trial_cost < cost) {
                 memcpy(coeffs, trial, sizeof(double) * 3);
-                memcpy(residual, trial_res, sizeof(double) * 3);
                 cost = trial_cost;
                 lambda = std::max(lambda * 0.5, 1e-12); /* step worked: trust the model more */
                 accepted = true;
@@ -282,6 +356,9 @@ double LM(const double rgb[3], double coeffs[3], int it = 15) {
 
         if (!accepted)
             break; /* converged, or no damped step can improve further */
+
+        /* Refresh residual and analytic Jacobian at the accepted point */
+        eval_residual_jac(coeffs, rgb, residual, jac);
     }
 
     return std::sqrt(cost);
