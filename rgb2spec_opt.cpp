@@ -11,18 +11,12 @@
 #include <stdexcept>
 #include <algorithm>
 
+#include <thread>
+#include <atomic>
+#include <vector>
+
 #include "details/cie1931.h"
 #include "details/lu.h"
-
-// Choose a parallelization scheme
-#if defined(RGB2SPEC_USE_TBB)
-#  include <tbb/tbb.h>
-#elif defined(_OPENMP)
-#  define RGB2SPEC_USE_OPENMP 1
-#elif defined(__APPLE__)
-#  define RGB2SPEC_USE_GCD    1
-#  include <dispatch/dispatch.h>
-#endif
 
 /// Discretization of quadrature scheme
 #define CIE_FINE_SAMPLES ((CIE_SAMPLES - 1) * 3 + 1)
@@ -338,75 +332,80 @@ int main(int argc, char **argv) {
     size_t bufsize = 3*3*res*res*res;
     float *out = new float[bufsize];
 
-#if defined(RGB2SPEC_USE_OPENMP)
-#  pragma omp parallel for collapse(2) default(none) schedule(dynamic) shared(stdout,scale,out,res)
-#endif
-    for (int l = 0; l < 3; ++l) {
-#if defined(RGB2SPEC_USE_TBB)
-        tbb::parallel_for(0, res, [&](size_t j) {
-#elif defined(RGB2SPEC_USE_GCD)
-        dispatch_apply(res, dispatch_get_global_queue(0, 0), ^(size_t j) {
-#else
-        for (int j = 0; j < res; ++j) {
-#endif
-            const double y = j / double(res - 1);
-            printf(".");
-            fflush(stdout);
-            for (int i = 0; i < res; ++i) {
-                const double x = i / double(res - 1);
-                double coeffs[3], rgb[3];
-                memset(coeffs, 0, sizeof(double)*3);
+    /* Each (l, j) slice is an independent unit of work: distinct slices write to
+       disjoint regions of 'out', so the tasks need no synchronization. */
+    auto process = [&](int l, int j) {
+        const double y = j / double(res - 1);
+        printf(".");
+        fflush(stdout);
+        for (int i = 0; i < res; ++i) {
+            const double x = i / double(res - 1);
+            double coeffs[3], rgb[3];
+            memset(coeffs, 0, sizeof(double)*3);
 
-                int start = res / 5;
+            int start = res / 5;
 
-                for (int k = start; k < res; ++k) {
-                    double b = (double) scale[k];
+            for (int k = start; k < res; ++k) {
+                double b = (double) scale[k];
 
-                    rgb[l] = b;
-                    rgb[(l + 1) % 3] = x*b;
-                    rgb[(l + 2) % 3] = y*b;
+                rgb[l] = b;
+                rgb[(l + 1) % 3] = x*b;
+                rgb[(l + 2) % 3] = y*b;
 
-                    double resid = LM(rgb, coeffs);
-                    (void) resid;
+                double resid = LM(rgb, coeffs);
+                (void) resid;
 
-                    double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
-                    double A = coeffs[0], B = coeffs[1], C = coeffs[2];
+                double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
+                double A = coeffs[0], B = coeffs[1], C = coeffs[2];
 
-                    int idx = ((l*res + k) * res + j)*res+i;
+                int idx = ((l*res + k) * res + j)*res+i;
 
-                    out[3*idx + 0] = float(A*(sqr(c1)));
-                    out[3*idx + 1] = float(B*c1 - 2*A*c0*(sqr(c1)));
-                    out[3*idx + 2] = float(C - B*c0*c1 + A*(sqr(c0*c1)));
-                    //out[3*idx + 2] = resid;
-                }
+                out[3*idx + 0] = float(A*(sqr(c1)));
+                out[3*idx + 1] = float(B*c1 - 2*A*c0*(sqr(c1)));
+                out[3*idx + 2] = float(C - B*c0*c1 + A*(sqr(c0*c1)));
+                //out[3*idx + 2] = resid;
+            }
 
-                memset(coeffs, 0, sizeof(double)*3);
-                for (int k = start; k>=0; --k) {
-                    double b = (double) scale[k];
+            memset(coeffs, 0, sizeof(double)*3);
+            for (int k = start; k>=0; --k) {
+                double b = (double) scale[k];
 
-                    rgb[l] = b;
-                    rgb[(l + 1) % 3] = x*b;
-                    rgb[(l + 2) % 3] = y*b;
+                rgb[l] = b;
+                rgb[(l + 1) % 3] = x*b;
+                rgb[(l + 2) % 3] = y*b;
 
-                    double resid = LM(rgb, coeffs);
-                    (void) resid;
+                double resid = LM(rgb, coeffs);
+                (void) resid;
 
-                    double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
-                    double A = coeffs[0], B = coeffs[1], C = coeffs[2];
+                double c0 = 360.0, c1 = 1.0 / (830.0 - 360.0);
+                double A = coeffs[0], B = coeffs[1], C = coeffs[2];
 
-                    int idx = ((l*res + k) * res + j)*res+i;
+                int idx = ((l*res + k) * res + j)*res+i;
 
-                    out[3*idx + 0] = float(A*(sqr(c1)));
-                    out[3*idx + 1] = float(B*c1 - 2*A*c0*(sqr(c1)));
-                    out[3*idx + 2] = float(C - B*c0*c1 + A*(sqr(c0*c1)));
-                    //out[3*idx + 2] = resid;
-                }
+                out[3*idx + 0] = float(A*(sqr(c1)));
+                out[3*idx + 1] = float(B*c1 - 2*A*c0*(sqr(c1)));
+                out[3*idx + 2] = float(C - B*c0*c1 + A*(sqr(c0*c1)));
+                //out[3*idx + 2] = resid;
             }
         }
-#if defined(RGB2SPEC_USE_TBB) || defined(RGB2SPEC_USE_GCD)
-        );
-#endif
-    }
+    };
+
+    /* A pool of worker threads pulls (l, j) slices from a shared
+       atomic counter. This helps because the cost is quite uneven. */
+    const int n_tasks = 3 * res;
+    std::atomic<int> next_task(0);
+    auto worker = [&]() {
+        int t;
+        while ((t = next_task.fetch_add(1)) < n_tasks)
+            process(t / res, t % res);
+    };
+
+    unsigned n_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < n_threads; ++t)
+        pool.emplace_back(worker);
+    for (std::thread &th : pool)
+        th.join();
 
     FILE *f = fopen(argv[2], "wb");
     if (f == nullptr)
