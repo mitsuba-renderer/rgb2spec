@@ -160,8 +160,8 @@ void init_tables(Gamut gamut) {
             for (int j = 0; j < 3; ++j)
                 rgb_tbl[k][i] += xyz_to_rgb[k][j] * xyz[j] * I * weight;
 
-        for (int i = 0; i < 3; ++i)
-            xyz_whitepoint[i] += xyz[i] * I * weight;
+        for (int channel = 0; channel < 3; ++channel)
+            xyz_whitepoint[channel] += xyz[channel] * I * weight;
     }
 }
 
@@ -175,8 +175,8 @@ void eval_residual(const double *coeffs, const double *rgb, double *residual) {
 
         /* Polynomial */
         double x = 0.0;
-        for (int i = 0; i < 3; ++i)
-            x = x * lambda + coeffs[i];
+        for (int coeff = 0; coeff < 3; ++coeff)
+            x = x * lambda + coeffs[coeff];
 
         /* Sigmoid */
         double s = sigmoid(x);

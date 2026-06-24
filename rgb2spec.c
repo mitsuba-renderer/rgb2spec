@@ -86,9 +86,19 @@ void rgb2spec_fetch(RGB2Spec *model, float rgb_[3], float out[RGB2SPEC_N_COEFFS]
             i = j;
 
     float z     = rgb[i],
-          scale = (res - 1) / z,
-          x     = rgb[(i + 1) % 3] * scale,
-          y     = rgb[(i + 2) % 3] * scale;
+          scale,
+          x,
+          y;
+
+    if (z <= 0.f) {
+        for (int j = 0; j < RGB2SPEC_N_COEFFS; ++j)
+            out[j] = model->data[j];
+        return;
+    }
+
+    scale = (res - 1) / z;
+    x     = rgb[(i + 1) % 3] * scale;
+    y     = rgb[(i + 2) % 3] * scale;
 
     /* Trilinearly interpolated lookup */
     uint32_t xi = rgb2spec_min((uint32_t) x, (uint32_t) (res - 2)),
@@ -135,11 +145,15 @@ float rgb2spec_eval_precise(float coeff[RGB2SPEC_N_COEFFS], float lambda) {
 
 float rgb2spec_eval_fast(float coeff[RGB2SPEC_N_COEFFS], float lambda) {
     float x = rgb2spec_fma(rgb2spec_fma(coeff[0], lambda, coeff[1]), lambda, coeff[2]),
+#if RGB2SPEC_HAS_X86_INTRINSICS && (defined(__SSE__) || defined(__x86_64__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1))
           y = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(rgb2spec_fma(x, x, 1.f))));
+#else
+          y = 1.f / sqrtf(rgb2spec_fma(x, x, 1.f));
+#endif
     return rgb2spec_fma(.5f * x, y, .5f);
 }
 
-#if defined(__SSE4_2__)
+#if RGB2SPEC_HAS_X86_INTRINSICS && defined(__SSE4_2__)
 static inline __m128 rgb2spec_fma128(__m128 a, __m128 b, __m128 c) {
     #if defined(__FMA__)
         return _mm_fmadd_ps(a, b, c);
@@ -161,7 +175,7 @@ __m128 rgb2spec_eval_sse(float coeff[RGB2SPEC_N_COEFFS], __m128 lambda) {
 }
 #endif
 
-#if defined(__AVX__)
+#if RGB2SPEC_HAS_X86_INTRINSICS && defined(__AVX__)
 __m256 rgb2spec_fma256(__m256 a, __m256 b, __m256 c) {
     #if defined(__FMA__)
         return _mm256_fmadd_ps(a, b, c);
@@ -183,7 +197,7 @@ __m256 rgb2spec_eval_avx(float coeff[RGB2SPEC_N_COEFFS], __m256 lambda) {
 }
 #endif
 
-#if defined(__AVX512F__)
+#if RGB2SPEC_HAS_X86_INTRINSICS && defined(__AVX512F__)
 __m512 rgb2spec_eval_avx512(float coeff[RGB2SPEC_N_COEFFS], __m512 lambda) {
     __m512 c0 = _mm512_set1_ps(coeff[0]), c1 = _mm512_set1_ps(coeff[1]),
            c2 = _mm512_set1_ps(coeff[2]), h = _mm512_set1_ps(.5f),
@@ -195,4 +209,3 @@ __m512 rgb2spec_eval_avx512(float coeff[RGB2SPEC_N_COEFFS], __m512 lambda) {
     return _mm512_fmadd_ps(_mm512_mul_ps(h, x), y, h);
 }
 #endif
-
