@@ -1,5 +1,7 @@
 #if defined(_MSC_VER)
-#  define NOMINMAX
+#  if !defined(NOMINMAX)
+#    define NOMINMAX
+#  endif
 #  define strcasecmp _stricmp
 #endif
 
